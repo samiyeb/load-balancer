@@ -6,18 +6,33 @@ import (
 	"net/http"
 )
 
+func handler(w http.ResponseWriter, r *http.Request) {
+	// Print the source IP
+	fmt.Printf("Received request from %s\n", r.RemoteAddr)
+
+	// Print the HTTP method, URI, and HTTP version
+	fmt.Printf("%s %s %s\n", r.Method, r.RequestURI, r.Proto)
+
+	// Print the Host header
+	fmt.Printf("Host: %s\n", r.Host)
+
+	// Print the User-Agent header
+	fmt.Printf("User-Agent: %s\n", r.UserAgent())
+
+	// Print the Accept header (if available)
+	fmt.Printf("Accept: %s\n", r.Header.Get("Accept"))
+
+	// Send a simple response back
+	fmt.Fprintln(w, "Request received!")
+}
+
 func main() {
-	// Hello world, the web server
+	// Setup HTTP server with the handler function
+	http.HandleFunc("/", handler)
 
-	helloHandler := func(w http.ResponseWriter, r *http.Request) {
-		fmt.Printf("Received request from %s\n", r.RemoteAddr)
-		fmt.Printf("GET / HTTP/1.1 %s\n", r.RemoteAddr)
-		fmt.Printf("Host: localhost %s\n", r.RemoteAddr)
-		fmt.Printf("User-Agent: curl/7.85.0 %s\n", r.RemoteAddr)
-		fmt.Printf("Accept: */* %s\n", r.RemoteAddr)
-	}
-
-	http.HandleFunc("/", helloHandler)
+	// Start the server on port 8080
+	log.Println("Starting server on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
+
 
