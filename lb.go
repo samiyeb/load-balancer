@@ -1,107 +1,160 @@
 package main
 
 import (
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"os"
-	"sync"
-	"time"
+    "fmt"
+    "io"
+    "log"
+    "net/http"
+    "net/url"
+    "sync"
+    "time"
 )
 
-const (
-	loadBalancerPort = ":80"
-	healthCheckPeriod = 10 * time.Second
-	healthCheckPath = "/health" // Path for health check
-)
-
-var backendServers = []string{
-	"http://localhost:8080",
-	"http://localhost:8081",
-	"http://localhost:8082",
-}
-var availableServers []string
-var currentServer int
-var mu sync.Mutex
-
-func handleConnection(w http.ResponseWriter, req *http.Request) {
-	mu.Lock()
-	if len(availableServers) == 0 {
-		http.Error(w, "No available backend servers", http.StatusServiceUnavailable)
-		mu.Unlock()
-		return
-	}
-
-	server := availableServers[currentServer]
-	currentServer = (currentServer + 1) % len(availableServers)
-	mu.Unlock()
-
-	resp, err := forwardRequest(req, server)
-	if err != nil {
-		http.Error(w, "Error forwarding request to backend server", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	copyResponse(w, resp)
+// Server struct for each backend server
+type Server struct {
+    URL    *url.URL
+    Alive  bool
+    mutex  sync.RWMutex
 }
 
-func forwardRequest(req *http.Request, serverURL string) (*http.Response, error) {
-	client := &http.Client{}
-	newReq, err := http.NewRequest(req.Method, serverURL+req.RequestURI, req.Body)
-	if err != nil {
-		return nil, err
-	}
-	newReq.Header = req.Header
-	return client.Do(newReq)
+// LoadBalancer struct to manage servers and requests
+type LoadBalancer struct {
+    Servers          []*Server
+    RoundRobinCount  int
+    mutex            sync.Mutex
+    HealthCheckURL   string
+    HealthCheckInterval time.Duration
 }
 
-func copyResponse(w http.ResponseWriter, resp *http.Response) {
-	for name, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(name, value)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+// NewServer creates a new server instance
+func NewServer(serverURL string) *Server {
+    parsedURL, _ := url.Parse(serverURL)
+    return &Server{
+        URL:   parsedURL,
+        Alive: true,
+    }
 }
 
-func healthCheckRoutine() {
-	for {
-		mu.Lock()
-		newAvailableServers := []string{}
+// SetAlive updates the alive status of the server
+func (s *Server) SetAlive(alive bool) {
+    s.mutex.Lock()
+    s.Alive = alive
+    s.mutex.Unlock()
+}
 
-		for _, server := range backendServers {
-			resp, err := http.Get(server + healthCheckPath)
-			if err == nil && resp.StatusCode == http.StatusOK {
-				newAvailableServers = append(newAvailableServers, server)
-				resp.Body.Close()
-			} else if resp != nil {
-				resp.Body.Close()
-			}
-		}
+// IsAlive checks if the server is alive
+func (s *Server) IsAlive() bool {
+    s.mutex.RLock()
+    alive := s.Alive
+    s.mutex.RUnlock()
+    return alive
+}
 
-		availableServers = newAvailableServers
-		mu.Unlock()
+// NewLoadBalancer initializes the load balancer
+func NewLoadBalancer(servers []string, healthCheckInterval time.Duration) *LoadBalancer {
+    var serverList []*Server
+    for _, serverURL := range servers {
+        server := NewServer(serverURL)
+        serverList = append(serverList, server)
+    }
+    lb := &LoadBalancer{
+        Servers:          serverList,
+        HealthCheckURL:   "/",
+        HealthCheckInterval: healthCheckInterval,
+    }
+    return lb
+}
 
-		time.Sleep(healthCheckPeriod)
-	}
+// GetNextAvailableServer returns the next server in round-robin
+func (lb *LoadBalancer) GetNextAvailableServer() *Server {
+    lb.mutex.Lock()
+    defer lb.mutex.Unlock()
+
+    serverCount := len(lb.Servers)
+    for i := 0; i < serverCount; i++ {
+        lb.RoundRobinCount = (lb.RoundRobinCount + 1) % serverCount
+        nextServer := lb.Servers[lb.RoundRobinCount]
+
+        if nextServer.IsAlive() {
+            return nextServer
+        }
+    }
+    return nil
+}
+
+// ServeHTTP handles incoming requests and forwards them to the backend server
+func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    server := lb.GetNextAvailableServer()
+    if server == nil {
+        http.Error(w, "No available servers", http.StatusServiceUnavailable)
+        return
+    }
+
+    proxyURL := server.URL.ResolveReference(r.URL)
+    req, err := http.NewRequest(r.Method, proxyURL.String(), r.Body)
+    if err != nil {
+        http.Error(w, "Failed to create request", http.StatusInternalServerError)
+        return
+    }
+
+    req.Header = r.Header
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        server.SetAlive(false)
+        http.Error(w, "Server error", http.StatusServiceUnavailable)
+        return
+    }
+    defer resp.Body.Close()
+
+    for key, values := range resp.Header {
+        for _, value := range values {
+            w.Header().Add(key, value)
+        }
+    }
+    w.WriteHeader(resp.StatusCode)
+    io.Copy(w, resp.Body)
+
+    fmt.Printf("Forwarded request to %s; received response: %d\n", server.URL, resp.StatusCode)
+}
+
+// healthCheck pings the server to see if it's alive
+func (lb *LoadBalancer) healthCheck(server *Server) {
+    resp, err := http.Get(server.URL.String() + lb.HealthCheckURL)
+    if err != nil || resp.StatusCode != http.StatusOK {
+        server.SetAlive(false)
+        fmt.Printf("Server %s is down\n", server.URL)
+    } else {
+        server.SetAlive(true)
+        fmt.Printf("Server %s is healthy\n", server.URL)
+    }
+}
+
+// StartHealthChecks periodically checks each server's health
+func (lb *LoadBalancer) StartHealthChecks() {
+    ticker := time.NewTicker(lb.HealthCheckInterval)
+    go func() {
+        for range ticker.C {
+            for _, server := range lb.Servers {
+                lb.healthCheck(server)
+            }
+        }
+    }()
 }
 
 func main() {
-	availableServers = append(availableServers, backendServers...)
-	http.HandleFunc("/", handleConnection)
-	fmt.Println("Load balancer started, listening on port", loadBalancerPort)
+    servers := []string{
+        "http://localhost:8080",
+        "http://localhost:8081",
+        "http://localhost:8082",
+    }
+    lb := NewLoadBalancer(servers, 10*time.Second)
+    lb.StartHealthChecks()
 
-	go healthCheckRoutine()
-
-	err := http.ListenAndServe(loadBalancerPort, nil)
-	if err != nil {
-		log.Fatalf("Error starting load balancer: %v", err)
-		os.Exit(1)
-	}
+    fmt.Println("Starting load balancer on port 80")
+    log.Fatal(http.ListenAndServe(":80", lb))
 }
+
 
 
 
