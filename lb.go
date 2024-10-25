@@ -2,37 +2,106 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
+	"sync"
+	"time"
 )
 
-func handler(w http.ResponseWriter, r *http.Request) {
-	// Print the source IP
-	fmt.Printf("Received request from %s\n", r.RemoteAddr)
+const (
+	loadBalancerPort = ":80"
+	healthCheckPeriod = 10 * time.Second
+	healthCheckPath = "/health" // Path for health check
+)
 
-	// Print the HTTP method, URI, and HTTP version
-	fmt.Printf("%s %s %s\n", r.Method, r.RequestURI, r.Proto)
+var backendServers = []string{
+	"http://localhost:8080",
+	"http://localhost:8081",
+	"http://localhost:8082",
+}
+var availableServers []string
+var currentServer int
+var mu sync.Mutex
 
-	// Print the Host header
-	fmt.Printf("Host: %s\n", r.Host)
+func handleConnection(w http.ResponseWriter, req *http.Request) {
+	mu.Lock()
+	if len(availableServers) == 0 {
+		http.Error(w, "No available backend servers", http.StatusServiceUnavailable)
+		mu.Unlock()
+		return
+	}
 
-	// Print the User-Agent header
-	fmt.Printf("User-Agent: %s\n", r.UserAgent())
+	server := availableServers[currentServer]
+	currentServer = (currentServer + 1) % len(availableServers)
+	mu.Unlock()
 
-	// Print the Accept header (if available)
-	fmt.Printf("Accept: %s\n", r.Header.Get("Accept"))
+	resp, err := forwardRequest(req, server)
+	if err != nil {
+		http.Error(w, "Error forwarding request to backend server", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
 
-	// Send a simple response back
-	fmt.Fprintln(w, "Request received!")
+	copyResponse(w, resp)
+}
+
+func forwardRequest(req *http.Request, serverURL string) (*http.Response, error) {
+	client := &http.Client{}
+	newReq, err := http.NewRequest(req.Method, serverURL+req.RequestURI, req.Body)
+	if err != nil {
+		return nil, err
+	}
+	newReq.Header = req.Header
+	return client.Do(newReq)
+}
+
+func copyResponse(w http.ResponseWriter, resp *http.Response) {
+	for name, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+func healthCheckRoutine() {
+	for {
+		mu.Lock()
+		newAvailableServers := []string{}
+
+		for _, server := range backendServers {
+			resp, err := http.Get(server + healthCheckPath)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				newAvailableServers = append(newAvailableServers, server)
+				resp.Body.Close()
+			} else if resp != nil {
+				resp.Body.Close()
+			}
+		}
+
+		availableServers = newAvailableServers
+		mu.Unlock()
+
+		time.Sleep(healthCheckPeriod)
+	}
 }
 
 func main() {
-	// Setup HTTP server with the handler function
-	http.HandleFunc("/", handler)
+	availableServers = append(availableServers, backendServers...)
+	http.HandleFunc("/", handleConnection)
+	fmt.Println("Load balancer started, listening on port", loadBalancerPort)
 
-	// Start the server on port 8080
-	log.Println("Starting server on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	go healthCheckRoutine()
+
+	err := http.ListenAndServe(loadBalancerPort, nil)
+	if err != nil {
+		log.Fatalf("Error starting load balancer: %v", err)
+		os.Exit(1)
+	}
 }
+
 
 
